@@ -336,7 +336,10 @@ def pick_coin():
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
         futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
         for fut in as_completed(futures):
-            res = fut.result()
+            try:
+                res = fut.result()
+            except Exception:
+                res = None
             if res:
                 results.append(res)
     if not results:
@@ -358,13 +361,17 @@ def pick_coin():
         f"Score: `{chosen['score']:.2f}`"
     )
 
-    now_send = time.time()
     with RECENT_BUYS_LOCK:
         last_buy = RECENT_BUYS.get(chosen["symbol"])
-        if last_buy and now_send < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
-            print(f"[{time.strftime('%H:%M:%S')}] Skipped duplicate (reserved): {chosen['symbol']}")
+        if last_buy and not last_buy.get("closed"):
             return None
-        RECENT_BUYS[chosen["symbol"]] = {"ts": now_send, "reserved": True}
+        if last_buy and time.time() < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
+            return None
+        # enforce MAX_CONCURRENT_POS
+        if len([k for k, v in RECENT_BUYS.items() if not v.get("closed")]) >= MAX_CONCURRENT_POS:
+            notify(f"⚠️ Max concurrent positions active ({MAX_CONCURRENT_POS}). Skipping new buy.")
+            return None
+        RECENT_BUYS[chosen["symbol"]] = {"ts": time.time(), "reserved": True, "closed": False, "processing": False}
         persist_recent_buys()
 
     sent = send_telegram(msg)
@@ -372,13 +379,14 @@ def pick_coin():
         with RECENT_BUYS_LOCK:
             RECENT_BUYS[chosen["symbol"]].update({"ts": time.time(), "reserved": False})
             persist_recent_buys()
-        print(f"[{time.strftime('%H:%M:%S')}] Signal -> {chosen['symbol']} score={chosen['score']:.2f}")
+        if ENABLE_TRADING:
+            t = threading.Thread(target=execute_trade, args=(chosen,), daemon=True)
+            t.start()
         return chosen
     else:
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(chosen["symbol"], None)
             persist_recent_buys()
-        print(f"[{time.strftime('%H:%M:%S')}] Telegram send failed for {chosen['symbol']}")
         return None
 
 # -------------------------
