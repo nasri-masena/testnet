@@ -328,64 +328,43 @@ def pick_coin():
             if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
                 continue
         pre.append((sym, last, qvol, ch))
-
     if not pre:
         return None
-
-    # prefer highest 24h volume
     pre.sort(key=lambda x: x[2], reverse=True)
     candidates = pre[:TOP_BY_24H_VOLUME]
     results = []
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
         futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
         for fut in as_completed(futures):
-            try:
-                res = fut.result()
-            except Exception:
-                res = None
+            res = fut.result()
             if res:
                 results.append(res)
-
     if not results:
         return None
-
-    # Apply your strict filters:
-    filtered = []
-    for r in results:
-        pct_1m = float(r.get("pct_1m") or 0.0)
-        vol_1m = r.get("vol_1m")
-        ob_bull = bool(r.get("ob_bull"))
-        score = float(r.get("score") or 0.0)
-        if pct_1m >= 1.0 and (vol_1m is not None and float(vol_1m) >= 0.004) and ob_bull and score >= 30.0:
-            filtered.append(r)
-
-    if not filtered:
-        return None
-
-    # choose highest score among filtered (tie-break by pct_1m)
-    chosen = sorted(filtered, key=lambda x: (float(x.get("score", 0.0)), float(x.get("pct_1m", 0.0))), reverse=True)[0]
+    strongs = [r for r in results if r["strong_candidate"]]
+    chosen_pool = strongs if strongs else results
+    chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
 
     msg = (
         f"🚀 *COIN SIGNAL*: `{chosen['symbol']}`\n"
         f"Price: `{chosen['last_price']}`\n"
         f"24h Change: `{chosen['24h_change']}`%\n"
+        f"5m Change: `{chosen['pct_5m']:.2f}`%\n"
         f"1m Change: `{chosen['pct_1m']:.2f}`%\n"
-        f"Volatility 1m: `{chosen.get('vol_1m')}`\n"
+        f"Volatility 5m: `{chosen['vol_5m']}`\n"
+        f"EMA OK: `{chosen['ema_ok']}` Uplift: `{chosen['ema_uplift']:.4f}`\n"
+        f"RSI: `{chosen['rsi']}`\n"
         f"Orderbook Bullish: `{chosen['ob_bull']}`\n"
         f"Score: `{chosen['score']:.2f}`"
     )
 
     now_send = time.time()
     with RECENT_BUYS_LOCK:
-        # enforce buy lock and max concurrent positions
         last_buy = RECENT_BUYS.get(chosen["symbol"])
         if last_buy and now_send < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
             print(f"[{time.strftime('%H:%M:%S')}] Skipped duplicate (reserved): {chosen['symbol']}")
             return None
-        if len([k for k, v in RECENT_BUYS.items() if not v.get("closed")]) >= MAX_CONCURRENT_POS:
-            notify(f"⚠️ Max concurrent positions active ({MAX_CONCURRENT_POS}). Skipping new buy.")
-            return None
-        RECENT_BUYS[chosen["symbol"]] = {"ts": now_send, "reserved": True, "closed": False}
+        RECENT_BUYS[chosen["symbol"]] = {"ts": now_send, "reserved": True}
         persist_recent_buys()
 
     sent = send_telegram(msg)
@@ -394,11 +373,6 @@ def pick_coin():
             RECENT_BUYS[chosen["symbol"]].update({"ts": time.time(), "reserved": False})
             persist_recent_buys()
         print(f"[{time.strftime('%H:%M:%S')}] Signal -> {chosen['symbol']} score={chosen['score']:.2f}")
-
-        # trigger live trade if enabled
-        if ENABLE_TRADING:
-            t = threading.Thread(target=execute_trade, args=(chosen,), daemon=True)
-            t.start()
         return chosen
     else:
         with RECENT_BUYS_LOCK:
@@ -406,7 +380,7 @@ def pick_coin():
             persist_recent_buys()
         print(f"[{time.strftime('%H:%M:%S')}] Telegram send failed for {chosen['symbol']}")
         return None
-        
+
 # -------------------------
 # Main loop / web healthcheck
 # -------------------------
